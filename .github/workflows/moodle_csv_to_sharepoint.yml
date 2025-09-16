@@ -1,1 +1,111 @@
+name: Moodle CSV to SharePoint
 
+on:
+  schedule:
+    - cron: "5 * * * *"    # jede Stunde +5 Min
+  workflow_dispatch:       # manuell auslösbar
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Download Moodle CSV and upload to SharePoint
+        env:
+          MOODLE_BASE: ${{ secrets.MOODLE_BASE }}
+          MOODLE_USER: ${{ secrets.MOODLE_USER }}
+          MOODLE_PASS: ${{ secrets.MOODLE_PASS }}
+          REPORT_ID:   ${{ secrets.REPORT_ID }}
+          GRAPH_TENANT_ID:     ${{ secrets.GRAPH_TENANT_ID }}
+          GRAPH_CLIENT_ID:     ${{ secrets.GRAPH_CLIENT_ID }}
+          GRAPH_CLIENT_SECRET: ${{ secrets.GRAPH_CLIENT_SECRET }}
+          SPSITE_ID: ${{ secrets.SPSITE_ID }}
+          SPDRIVE_ID: ${{ secrets.SPDRIVE_ID }}
+          SP_FOLDER:  ${{ secrets.SP_FOLDER }}
+        run: |
+          python - <<'PY'
+          import os, re, datetime, requests, sys
+
+          BASE = os.environ["MOODLE_BASE"].rstrip("/")
+          USER = os.environ["MOODLE_USER"]
+          PASS = os.environ["MOODLE_PASS"]
+          RID  = os.environ["REPORT_ID"]
+
+          TENANT = os.environ["GRAPH_TENANT_ID"]
+          CID    = os.environ["GRAPH_CLIENT_ID"]
+          CSEC   = os.environ["GRAPH_CLIENT_SECRET"]
+          SITE   = os.environ["SPSITE_ID"]
+          DRIVE  = os.environ["SPDRIVE_ID"]
+          FOLDER = os.environ.get("SP_FOLDER","").strip()
+
+          session = requests.Session()
+          session.headers.update({"User-Agent":"github-actions-moodle-uploader/1.0"})
+
+          # 1) Loginseite → logintoken
+          r = session.get(f"{BASE}/login/index.php", timeout=30)
+          m = re.search(r'name="logintoken"\s+value="([^"]+)"', r.text)
+          if not m:
+              print("logintoken nicht gefunden – ist Passwort-Login erlaubt?", file=sys.stderr)
+              sys.exit(1)
+          token = m.group(1)
+
+          # 2) Login (Form POST)
+          r = session.post(f"{BASE}/login/index.php",
+                           data={"username": USER, "password": PASS, "logintoken": token},
+                           allow_redirects=True, timeout=30)
+          # Quick-Check: /my/ sollte nicht zur Loginseite führen
+          chk = session.get(f"{BASE}/my/", allow_redirects=True, timeout=30)
+          if "login/index.php" in chk.url:
+              print("Login fehlgeschlagen (evtl. SSO erzwungen?)", file=sys.stderr)
+              sys.exit(2)
+
+          # 3) CSV abrufen
+          csv_url = f"{BASE}/report/customsql/view.php?id={RID}&download=1"
+          r = session.get(csv_url, timeout=120)
+          if r.status_code != 200 or not r.content:
+              print(f"CSV-Download fehlgeschlagen: HTTP {r.status_code}", file=sys.stderr)
+              sys.exit(3)
+          csv_bytes = r.content
+
+          # 4) Graph Token
+          tok = requests.post(
+              f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token",
+              data={
+                  "client_id": CID,
+                  "client_secret": CSEC,
+                  "scope": "https://graph.microsoft.com/.default",
+                  "grant_type": "client_credentials",
+              },
+              timeout=30,
+          )
+          tok.raise_for_status()
+          access_token = tok.json()["access_token"]
+
+          # 5) Upload nach SharePoint
+          ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M")
+          fname = f"moodle_report_{RID}_{ts}.csv"
+          if FOLDER:
+              path = f":/{FOLDER}/{fname}:/content"
+          else:
+              path = f":/{fname}:/content"
+
+          up = requests.put(
+              f"https://graph.microsoft.com/v1.0/sites/{SITE}/drives/{DRIVE}/root{path}",
+              headers={"Authorization": f"Bearer {access_token}"},
+              data=csv_bytes,
+              timeout=180,
+          )
+          if up.status_code not in (200, 201):
+              print(f"SharePoint Upload fehlgeschlagen: HTTP {up.status_code} {up.text}", file=sys.stderr)
+              sys.exit(4)
+          print(f"OK – hochgeladen als {fname}")
+          PY
